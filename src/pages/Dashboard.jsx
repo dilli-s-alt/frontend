@@ -18,24 +18,29 @@ export default function Dashboard() {
   const [campaigns, setCampaigns] = useState([]);
   const [targets, setTargets] = useState([]);
   const [importing, setImporting] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [templates, setTemplates] = useState([]);
 
-  const fetchData = () => {
-    API.get("/api/analytics")
-      .then((res) => {
-        setStats(res.data);
-        setStatus("Live metrics loaded from the backend.");
-      })
-      .catch((error) => {
-        setStatus(getApiErrorMessage(error, "Analytics could not be loaded."));
-      });
+  const fetchData = async () => {
+    setRefreshing(true);
+    try {
+      const [statsRes, campaignsRes, targetsRes, templatesRes] = await Promise.all([
+        API.get("/api/analytics"),
+        API.get("/api/campaign"),
+        API.get("/api/targets"),
+        API.get("/api/campaign/templates")
+      ]);
 
-    API.get("/api/campaign")
-      .then((res) => setCampaigns(Array.isArray(res.data) ? res.data : []))
-      .catch(() => setCampaigns([]));
-
-    API.get("/api/targets")
-      .then((res) => setTargets(Array.isArray(res.data) ? res.data : []))
-      .catch(() => setTargets([]));
+      setStats(statsRes.data);
+      setCampaigns(Array.isArray(campaignsRes.data) ? campaignsRes.data : []);
+      setTargets(Array.isArray(targetsRes.data) ? targetsRes.data : []);
+      setTemplates(Array.isArray(templatesRes.data) ? templatesRes.data : []);
+      setStatus(`Data refreshed at ${new Date().toLocaleTimeString()}`);
+    } catch (error) {
+      setStatus(getApiErrorMessage(error, "Refresh failed."));
+    } finally {
+      setRefreshing(false);
+    }
   };
 
   useEffect(() => {
@@ -47,27 +52,83 @@ export default function Dashboard() {
     if (!file) return;
 
     setImporting(true);
+
+    // Helper: map a parsed result set to target objects
+    const mapRows = (data) => {
+      const pEmails = ["email", "e-mail", "mail", "email address"];
+      const pFirst  = ["name", "first name", "firstname", "first_name", "fname", "given name"];
+      const pLast   = ["last name", "lastname", "last_name", "lname", "surname"];
+      const pDept   = ["department", "dept", "team", "group", "division"];
+
+      return data.map((row) => {
+        const isObj = row !== null && typeof row === "object" && !Array.isArray(row);
+        let email, first, last, dept;
+
+        if (isObj) {
+          // Header mode: keys have already been lowercased + trimmed by transformHeader
+          const getV = (names) => {
+            const k = Object.keys(row).find(key => names.includes(key));
+            return k ? row[k] : null;
+          };
+          email = getV(pEmails);
+          first = getV(pFirst);
+          last  = getV(pLast);
+          dept  = getV(pDept);
+        } else if (Array.isArray(row)) {
+          // No-header mode: scan for the cell that contains @
+          const emailIdx = row.findIndex(v => v?.toString().includes("@"));
+          if (emailIdx !== -1) {
+            email = row[emailIdx];
+            first = emailIdx !== 0 ? row[0] : "New";
+            last  = emailIdx !== 1 ? row[1] : "Target";
+            dept  = row[emailIdx + 1] || row[4] || "General";
+          }
+        }
+
+        if (!email || !email.toString().includes("@")) return null;
+
+        return {
+          first_name:  (first || "New").toString().trim(),
+          last_name:   (last  || "Target").toString().trim(),
+          email:       email.toString().trim(),
+          department:  (dept  || "General").toString().trim()
+        };
+      }).filter(Boolean);
+    };
+
+    // Send payload to backend
+    const submit = (payload) => {
+      if (payload.length === 0) {
+        alert("No valid emails found in CSV.\n\nYour CSV must have an 'Email' column (or 'Name', 'Email', 'Department' columns).");
+        setImporting(false);
+        return;
+      }
+      API.post("/api/targets/bulk", { targets: payload })
+        .then(() => {
+          alert(`🎉 Successfully imported ${payload.length} targets!`);
+          fetchData();
+        })
+        .catch((err) => alert(getApiErrorMessage(err, "CSV Import failed.")))
+        .finally(() => { setImporting(false); e.target.value = null; });
+    };
+
+    // Parse with headers first
     Papa.parse(file, {
       header: true,
-      skipEmptyLines: true,
-      complete: (results) => {
-        const payload = results.data.map((row) => ({
-          first_name: row.first_name || row.Firstname || row.Name?.split(" ")[0],
-          last_name: row.last_name || row.Lastname || row.Name?.split(" ")[1] || "Target",
-          email: row.email || row.Email,
-          department: row.department || row.Department || "General"
-        })).filter(t => t.email);
-
-        API.post("/api/targets/bulk", { targets: payload })
-          .then(() => {
-            alert(`Successfully imported ${payload.length} targets.`);
-            fetchData();
-          })
-          .catch((err) => alert(getApiErrorMessage(err, "CSV Import failed.")))
-          .finally(() => {
-            setImporting(false);
-            e.target.value = null;
+      skipEmptyLines: "greedy",
+      transformHeader: (h) => h.replace(/[^\x20-\x7E]/g, "").toLowerCase().trim(),
+      complete: (r1) => {
+        const payload = mapRows(r1.data);
+        if (payload.length > 0) {
+          submit(payload);
+        } else {
+          // Fallback: parse without headers (positional columns)
+          Papa.parse(file, {
+            header: false,
+            skipEmptyLines: "greedy",
+            complete: (r2) => submit(mapRows(r2.data))
           });
+        }
       }
     });
   };
@@ -84,6 +145,24 @@ export default function Dashboard() {
     API.delete(`/api/campaign/${id}`)
       .then(() => fetchData())
       .catch((err) => alert(getApiErrorMessage(err, "Delete failed")));
+  };
+
+  const deleteTemplate = (id) => {
+    if (!window.confirm("Delete this template?")) return;
+    API.delete(`/api/campaign/templates/${id}`)
+      .then(() => fetchData())
+      .catch((err) => alert(getApiErrorMessage(err, "Delete failed")));
+  };
+
+  const handleSystemReset = () => {
+    if (!window.confirm("⚠️ DANGER: Factory Reset?\n\nThis will PERMANENTLY delete all targets, campaigns, and experimental data. Professional templates will be restored to default.\n\nContinue?")) return;
+    
+    API.post("/api/system/reset")
+      .then(() => {
+        alert("System Reset Complete. Your simulation environment is fresh.");
+        fetchData();
+      })
+      .catch((err) => alert(getApiErrorMessage(err, "Reset failed")));
   };
 
   const departmentSummary = stats.department_breakdown?.reduce((acc, item) => {
@@ -108,12 +187,30 @@ export default function Dashboard() {
   const departmentRows = Object.values(departmentSummary || {});
 
   return (
-    <div className="page-shell">
-      <div className="dashboard-shell">
+    <>
         <section className="hero-banner">
           <span className="eyebrow">Simulation Overview</span>
-          <h1 className="page-title">PhishScale Dashboard</h1>
-          <p>Global security simulation management as per Phase 1-4 objectives.</p>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <h1 className="page-title">Simulation Live Feed</h1>
+            <div style={{ display: "flex", gap: "12px" }}>
+              <button
+                onClick={fetchData}
+                className="ghost-btn"
+                disabled={refreshing}
+                style={{ padding: "8px 20px" }}
+              >
+                {refreshing ? "Refreshing..." : "↺ Refresh Data"}
+              </button>
+              <button
+                onClick={handleSystemReset}
+                className="ghost-btn"
+                style={{ padding: "8px 20px", color: "#ff4757", borderColor: "#ff4757" }}
+              >
+                ⚠ Factory Reset
+              </button>
+            </div>
+          </div>
+          <p>Global security simulation management. Backend status: {status}</p>
         </section>
 
         <section className="stats-grid">
@@ -205,6 +302,35 @@ export default function Dashboard() {
         </div>
 
         <section className="panel-card" style={{ marginTop: "24px" }}>
+          <h2 className="panel-heading">Template Library (Pretexts)</h2>
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Template Name</th>
+                  <th>Category</th>
+                  <th style={{ textAlign: "right" }}>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {templates.map((t) => (
+                  <tr key={t.id}>
+                    <td>{t.name}</td>
+                    <td>{t.category}</td>
+                    <td style={{ textAlign: "right" }}>
+                      <button onClick={() => deleteTemplate(t.id)} className="delete-btn">Delete</button>
+                    </td>
+                  </tr>
+                ))}
+                {templates.length === 0 && (
+                  <tr><td colSpan="3">No templates created. Add one in the Campaign section.</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section className="panel-card" style={{ marginTop: "24px" }}>
           <h2 className="panel-heading">Active Campaigns</h2>
           <div className="table-wrap">
             <table className="data-table">
@@ -232,7 +358,6 @@ export default function Dashboard() {
             </table>
           </div>
         </section>
-      </div>
-    </div>
+    </>
   );
 }
